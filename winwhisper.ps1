@@ -156,233 +156,167 @@ if ($Uninstall) {
 }
 
 # ============================================================================
-# 5. LOAD SYSTEM.SPEECH
+# 5. SPEECH ENGINE — WinRT engine process (cloud quality)
 # ============================================================================
 
-Write-Log "Loading System.Speech..."
-try {
-    Add-Type -AssemblyName System.Speech
-    Write-Log "System.Speech loaded" "OK"
-} catch {
-    Write-Host "ERROR: Failed to load System.Speech assembly: $_" -ForegroundColor Red
-    exit 1
-}
+$script:ENGINE_PATH = Join-Path $PSScriptRoot 'winwhisper-engine.exe'
+$script:engineProc = $null
+$script:engineReader = $null
+$script:engineReaderHandle = $null
+$script:engineEvents = $null
 
-# ============================================================================
-# 6. C# SPEECH MANAGER (System.Speech.Recognition — standard .NET events)
-# ============================================================================
-
-Write-Log "Compiling C# speech manager..."
-
-$managerCode = @'
-using System;
-using System.Speech.Recognition;
-using System.Text;
-using System.Threading;
-
-public class SpeechManager : IDisposable
-{
-    private SpeechRecognitionEngine _engine;
-    private StringBuilder _accumulated = new StringBuilder();
-    private string _currentHypothesis = "";
-    private int _resultCount = 0;
-    private int _hypothesisCount = 0;
-    private volatile bool _isListening = false;
-    private string _lastError = null;
-
-    public string AccumulatedText { get { return _accumulated.ToString(); } }
-    public string CurrentHypothesis { get { return _currentHypothesis; } }
-    public int ResultCount { get { return _resultCount; } }
-    public int HypothesisCount { get { return _hypothesisCount; } }
-    public bool IsListening { get { return _isListening; } }
-    public string LastError { get { return _lastError; } }
-
-    public string Initialize(string culture)
-    {
-        try
-        {
-            if (!string.IsNullOrEmpty(culture))
-            {
-                var ci = new System.Globalization.CultureInfo(culture);
-                _engine = new SpeechRecognitionEngine(ci);
-            }
-            else
-            {
-                _engine = new SpeechRecognitionEngine();
-            }
-
-            _engine.SetInputToDefaultAudioDevice();
-            _engine.LoadGrammar(new DictationGrammar());
-
-            // Wire events (standard .NET — these just work!)
-            _engine.SpeechRecognized += OnSpeechRecognized;
-            _engine.SpeechHypothesized += OnSpeechHypothesized;
-            _engine.RecognizeCompleted += OnRecognizeCompleted;
-
-            return "OK|" + _engine.RecognizerInfo.Culture.DisplayName;
-        }
-        catch (Exception ex)
-        {
-            return "ERROR: " + ex.GetType().Name + ": " + ex.Message;
-        }
-    }
-
-    public void ClearAccumulated()
-    {
-        _accumulated.Clear();
-        _resultCount = 0;
-        _hypothesisCount = 0;
-        _currentHypothesis = "";
-        _lastError = null;
-    }
-
-    public string StartListening()
-    {
-        try
-        {
-            _engine.RecognizeAsync(RecognizeMode.Multiple);
-            _isListening = true;
-            return "OK";
-        }
-        catch (Exception ex)
-        {
-            _lastError = ex.Message;
-            return "ERROR: " + ex.Message;
-        }
-    }
-
-    public void StopListening()
-    {
-        try
-        {
-            _engine.RecognizeAsyncCancel();
-        }
-        catch { }
-        _isListening = false;
-    }
-
-    private void OnSpeechRecognized(object sender, SpeechRecognizedEventArgs e)
-    {
-        if (e.Result != null && !string.IsNullOrWhiteSpace(e.Result.Text))
-        {
-            if (_accumulated.Length > 0) _accumulated.Append(" ");
-            _accumulated.Append(e.Result.Text);
-            Interlocked.Increment(ref _resultCount);
-            _currentHypothesis = "";  // Clear hypothesis after final result
-        }
-    }
-
-    private void OnSpeechHypothesized(object sender, SpeechHypothesizedEventArgs e)
-    {
-        if (e.Result != null)
-        {
-            _currentHypothesis = e.Result.Text;
-            Interlocked.Increment(ref _hypothesisCount);
-        }
-    }
-
-    private void OnRecognizeCompleted(object sender, RecognizeCompletedEventArgs e)
-    {
-        _isListening = false;
-        if (e.Error != null)
-        {
-            _lastError = e.Error.Message;
-        }
-    }
-
-    public void Dispose()
-    {
-        try { _engine.RecognizeAsyncCancel(); } catch { }
-        try { _engine.Dispose(); } catch { }
-    }
-}
-'@
-
-try {
-    Add-Type -TypeDefinition $managerCode -ReferencedAssemblies @(
-        "System.Speech"
-    ) -ErrorAction Stop
-    Write-Log "C# speech manager compiled" "OK"
-} catch {
-    Write-Host "ERROR: Failed to compile speech manager: $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
-}
-
-# ============================================================================
-# 7. SPEECH SERVICE
-# ============================================================================
-
-$script:manager = $null
+# Engine state (updated by background reader)
 $script:isListening = $false
+$script:accumulatedText = ''
+$script:currentHypothesis = ''
+$script:lastStoppedText = $null
 $script:history = @()
 $script:lastHotkeyTime = [DateTime]::MinValue
 
-function Initialize-SpeechRecognizer {
-    try {
-        Write-Log "Initializing speech service..."
-
-        $script:manager = New-Object SpeechManager
-        $lang = $script:config.language
-        $initResult = $script:manager.Initialize($lang)
-
-        if ($initResult.StartsWith("ERROR")) {
-            throw $initResult
-        }
-
-        $parts = $initResult.Split('|')
-        $culture = if ($parts.Length -gt 1) { $parts[1] } else { "unknown" }
-        Write-Log "SpeechRecognitionEngine created ($culture)" "OK"
-
-        return $true
-    } catch {
-        Write-Log "Speech init failed: $_" "ERROR"
-        Write-Host "ERROR: Failed to initialize speech recognition:" -ForegroundColor Red
-        Write-Host "       $($_.Exception.Message)" -ForegroundColor Red
+function Start-Engine {
+    if (-not (Test-Path $script:ENGINE_PATH)) {
+        Write-Log "Engine not found at $($script:ENGINE_PATH)" "ERROR"
+        Write-Host "ERROR: winwhisper-engine.exe not found. Build it first." -ForegroundColor Red
         return $false
+    }
+
+    Write-Log "Starting speech engine..."
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $script:ENGINE_PATH
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.CreateNoWindow = $true
+
+    $script:engineProc = New-Object System.Diagnostics.Process
+    $script:engineProc.StartInfo = $psi
+    $script:engineProc.Start() | Out-Null
+
+    # Read init lines synchronously (before starting background reader)
+    $l1 = $script:engineProc.StandardOutput.ReadLine()
+    $l2 = $script:engineProc.StandardOutput.ReadLine()
+    Write-Log "Engine: $l1"
+    Write-Log "Engine: $l2"
+
+    # Verify initialization
+    if (-not $l2 -or -not $l2.Contains('"ready"')) {
+        Write-Log "Engine failed to initialize" "ERROR"
+        return $false
+    }
+
+    # Start background reader — puts JSON events into a ConcurrentQueue
+    $script:engineEvents = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+    $script:engineReader = [PowerShell]::Create()
+    $null = $script:engineReader.AddScript({
+        param($stdout, $queue)
+        while ($true) {
+            $line = $stdout.ReadLine()
+            if ($line -eq $null) { break }
+            $queue.Enqueue($line)
+        }
+    }).AddArgument($script:engineProc.StandardOutput).AddArgument($script:engineEvents)
+    $script:engineReaderHandle = $script:engineReader.BeginInvoke()
+
+    Write-Log "Speech engine started (WinRT cloud)" "OK"
+    return $true
+}
+
+function Send-EngineCommand([string]$cmd) {
+    if ($script:engineProc -and -not $script:engineProc.HasExited) {
+        try {
+            $script:engineProc.StandardInput.WriteLine($cmd)
+            $script:engineProc.StandardInput.Flush()
+            Write-Log "Engine cmd: $cmd"
+        } catch {
+            Write-Log "Engine send failed: $_" "ERROR"
+        }
     }
 }
 
-# NOTE: Initialize-SpeechRecognizer is called in section 14 after WinForms.
+function Stop-Engine {
+    if ($script:engineProc -and -not $script:engineProc.HasExited) {
+        try {
+            Send-EngineCommand 'quit'
+            if (-not $script:engineProc.WaitForExit(2000)) {
+                $script:engineProc.Kill()
+            }
+        } catch {}
+    }
+    if ($script:engineReader) {
+        try { $script:engineReader.Stop() } catch {}
+        try { $script:engineReader.Dispose() } catch {}
+    }
+    Write-Log "Engine stopped"
+}
+
+function Initialize-SpeechRecognizer {
+    return (Start-Engine)
+}
+
+# NOTE: Initialize-SpeechRecognizer is called in section 12 after WinForms.
 
 # ============================================================================
-# 8. TEST SPEECH MODE (early exit)
+# 6. TEST SPEECH MODE (early exit)
 # ============================================================================
 
 if ($TestSpeech) {
-    if (-not (Initialize-SpeechRecognizer)) { exit 1 }
+    if (-not (Start-Engine)) { exit 1 }
 
-    Write-Host ""
-    Write-Host "=== WinWhisper: Quick Speech Test ===" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "Speak a short phrase (10 second timeout)..." -ForegroundColor Yellow
-    Write-Host ""
+    Write-Host ''
+    Write-Host '=== WinWhisper: Quick Speech Test ===' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host 'Speak a short phrase (5 seconds)...' -ForegroundColor Yellow
+    Write-Host ''
 
-    try {
-        $engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine
-        $engine.SetInputToDefaultAudioDevice()
-        $engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
-        $result = $engine.Recognize([TimeSpan]::FromSeconds(10))
+    Send-EngineCommand 'start'
 
-        if ($result -and $result.Text.Length -gt 0) {
-            Write-Host "  Confidence: $($result.Confidence)" -ForegroundColor White
-            Write-Host "  Text:       $($result.Text)" -ForegroundColor White
-            Write-Host ""
-            Write-Host "[OK] Speech recognition is working!" -ForegroundColor Green
-        } else {
-            Write-Host "[WARN] No text captured. Make sure your microphone is working." -ForegroundColor Yellow
+    # Drain events for 5 seconds
+    for ($i = 0; $i -lt 50; $i++) {
+        Start-Sleep -Milliseconds 100
+        $line = $null
+        while ($script:engineEvents.TryDequeue([ref]$line)) {
+            try {
+                $evt = $line | ConvertFrom-Json
+                switch ($evt.type) {
+                    'hypothesis' { Write-Host "  [partial] $($evt.text)" -ForegroundColor DarkGray }
+                    'result'     { Write-Host "  [result]  $($evt.text) ($($evt.confidence))" -ForegroundColor White }
+                    'status'     { Write-Host "  [status]  $($evt.message)" -ForegroundColor Gray }
+                    'error'      { Write-Host "  [error]   $($evt.message)" -ForegroundColor Red }
+                }
+            } catch {}
         }
-
-        $engine.Dispose()
-    } catch {
-        Write-Host "[FAIL] $_" -ForegroundColor Red
     }
 
-    $script:manager.Dispose()
+    Send-EngineCommand 'stop'
+    Start-Sleep -Milliseconds 1000
+
+    # Drain remaining
+    $line = $null
+    while ($script:engineEvents.TryDequeue([ref]$line)) {
+        try {
+            $evt = $line | ConvertFrom-Json
+            if ($evt.type -eq 'stopped') {
+                if ($evt.text -and $evt.text.Length -gt 0) {
+                    Write-Host ''
+                    Write-Host "  Text: $($evt.text)" -ForegroundColor Cyan
+                    Write-Host "  Results: $($evt.results)" -ForegroundColor Gray
+                    Write-Host ''
+                    Write-Host '[OK] WinRT cloud speech recognition is working!' -ForegroundColor Green
+                } else {
+                    Write-Host '[WARN] No text captured. Make sure your microphone is working.' -ForegroundColor Yellow
+                }
+            }
+        } catch {}
+    }
+
+    Stop-Engine
     exit 0
 }
 
 # ============================================================================
-# 9. LOAD WINFORMS + SINGLE-INSTANCE CHECK
+# 7. LOAD WINFORMS + SINGLE-INSTANCE CHECK
 # ============================================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -397,7 +331,7 @@ if (-not $script:mutex.WaitOne(0, $false)) {
 }
 
 # ============================================================================
-# 10. P/INVOKE NATIVE METHODS
+# 8. P/INVOKE NATIVE METHODS
 # ============================================================================
 
 Write-Log "Loading native methods..."
@@ -506,7 +440,7 @@ try {
 }
 
 # ============================================================================
-# 11. WINFORMS: HotkeyForm + OverlayForm
+# 9. WINFORMS: HotkeyForm + OverlayForm
 # ============================================================================
 
 Write-Log "Compiling WinForms classes..."
@@ -633,41 +567,36 @@ try {
 }
 
 # ============================================================================
-# 12. SPEECH CONTROL FUNCTIONS
+# 10. SPEECH CONTROL FUNCTIONS
 # ============================================================================
 
 function Start-Listening {
     if ($script:isListening) { return }
-    try {
-        $script:manager.ClearAccumulated()
-        $script:lastResultCount = 0
-        $script:lastHypothesisCount = 0
-
-        $startResult = $script:manager.StartListening()
-        if ($startResult -ne "OK") {
-            throw $startResult
-        }
-
-        $script:isListening = $true
-        Write-Log "Listening started" "OK"
-    } catch {
-        Write-Log "Start failed: $_" "ERROR"
-        $script:isListening = $false
-    }
+    $script:accumulatedText = ''
+    $script:currentHypothesis = ''
+    $script:lastStoppedText = $null
+    Send-EngineCommand 'start'
+    # isListening is set to true when we receive "listening" status from the engine
+    # but set it immediately for UI responsiveness
+    $script:isListening = $true
+    Write-Log "Listening started" "OK"
 }
 
 function Stop-Listening {
     if (-not $script:isListening) { return "" }
     $script:isListening = $false
+    Send-EngineCommand 'stop'
+    Write-Log "Stop sent to engine"
 
-    $script:manager.StopListening()
-
-    $text = $script:manager.AccumulatedText
-    Write-Log "Listening stopped. Results=$($script:manager.ResultCount) Hypotheses=$($script:manager.HypothesisCount) Text='$text'" "OK"
-    if ($script:manager.LastError) {
-        Write-Log "Manager last error: $($script:manager.LastError)" "WARN"
+    # Wait briefly for the "stopped" event with final text
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    while ([DateTime]::UtcNow -lt $deadline -and $script:lastStoppedText -eq $null) {
+        Start-Sleep -Milliseconds 50
+        Process-EngineEvents
     }
 
+    $text = if ($script:lastStoppedText -ne $null) { $script:lastStoppedText } else { $script:accumulatedText }
+    Write-Log "Listening stopped. Text='$text'" "OK"
     return $text
 }
 
@@ -683,8 +612,44 @@ function Add-History([string]$text) {
     }
 }
 
+function Process-EngineEvents {
+    if (-not $script:engineEvents) { return }
+    $line = $null
+    while ($script:engineEvents.TryDequeue([ref]$line)) {
+        try {
+            $evt = $line | ConvertFrom-Json
+            switch ($evt.type) {
+                'hypothesis' {
+                    $script:currentHypothesis = $evt.text
+                    Write-Log "Hypothesis: $($evt.text)"
+                }
+                'result' {
+                    if ($script:accumulatedText.Length -gt 0) {
+                        $script:accumulatedText += ' '
+                    }
+                    $script:accumulatedText += $evt.text
+                    $script:currentHypothesis = ''
+                    Write-Log "Result: $($evt.text) ($($evt.confidence))"
+                }
+                'stopped' {
+                    $script:lastStoppedText = $evt.text
+                    Write-Log "Stopped: results=$($evt.results) text='$($evt.text)'"
+                }
+                'status' {
+                    Write-Log "Engine status: $($evt.message)"
+                }
+                'error' {
+                    Write-Log "Engine error: $($evt.message)" "ERROR"
+                }
+            }
+        } catch {
+            Write-Log "Failed to parse engine event: $line" "WARN"
+        }
+    }
+}
+
 # ============================================================================
-# 13. TRAY ICON
+# 11. TRAY ICON
 # ============================================================================
 
 function New-TrayIcon([string]$state) {
@@ -701,7 +666,7 @@ function New-TrayIcon([string]$state) {
 }
 
 # ============================================================================
-# 14. BUILD UI
+# 12. BUILD UI
 # ============================================================================
 
 Write-Log "Starting $($script:APP_NAME) v$($script:VERSION)..."
@@ -735,30 +700,20 @@ Write-Log "Hotkey registered (VK=$hotkeyVk, MOD=$hotkeyMod)" "OK"
 # Create overlay
 $script:overlay = New-Object OverlayForm
 
-# Polling timer: updates overlay with hypothesis/result text from the manager
+# Polling timer: drains engine events and updates overlay
 # (runs on WinForms UI thread, so it works during Application.Run)
-$script:lastResultCount = 0
-$script:lastHypothesisCount = 0
 $script:pollTimer = New-Object System.Windows.Forms.Timer
-$script:pollTimer.Interval = 150  # 150ms poll interval
+$script:pollTimer.Interval = 100  # 100ms poll interval
 $script:pollTimer.Add_Tick({
-    if ($script:isListening -and $script:manager) {
-        # Show hypothesis text (real-time partial recognition)
-        $hCount = $script:manager.HypothesisCount
-        if ($hCount -gt $script:lastHypothesisCount) {
-            $script:lastHypothesisCount = $hCount
-            $hyp = $script:manager.CurrentHypothesis
-            $acc = $script:manager.AccumulatedText
-            $displayText = if ($acc -and $hyp) { "$acc $hyp..." } elseif ($hyp) { "$hyp..." } elseif ($acc) { $acc } else { "Listening..." }
-            $script:overlay.SetText($displayText)
-        }
+    # Process engine events from background reader
+    Process-EngineEvents
 
-        # Show final result text
-        $rCount = $script:manager.ResultCount
-        if ($rCount -gt $script:lastResultCount) {
-            $script:lastResultCount = $rCount
-            $script:overlay.SetText($script:manager.AccumulatedText)
-        }
+    # Update overlay if listening
+    if ($script:isListening) {
+        $hyp = $script:currentHypothesis
+        $acc = $script:accumulatedText
+        $displayText = if ($acc -and $hyp) { "$acc $hyp..." } elseif ($hyp) { "$hyp..." } elseif ($acc) { $acc } else { "Listening..." }
+        $script:overlay.SetText($displayText)
     }
 })
 $script:pollTimer.Start()
@@ -852,7 +807,7 @@ $menu.Add_Opening({
 })
 
 # ============================================================================
-# 15. HOTKEY TOGGLE LOGIC
+# 13. HOTKEY TOGGLE LOGIC
 # ============================================================================
 
 $script:hotkeyForm.Add_HotkeyPressed({
@@ -945,7 +900,7 @@ $script:hotkeyForm.Add_HotkeyPressed({
 })
 
 # ============================================================================
-# 16. CLEANUP + EXIT
+# 14. CLEANUP + EXIT
 # ============================================================================
 
 function Exit-App {
@@ -955,10 +910,10 @@ function Exit-App {
     try { [WinAPI]::UnregisterHotKey($script:hotkeyForm.Handle, $script:HOTKEY_ID) | Out-Null } catch {}
 
     if ($script:isListening) {
-        try { $script:manager.StopListening() } catch {}
+        Send-EngineCommand 'stop'
     }
 
-    try { $script:manager.Dispose() } catch {}
+    Stop-Engine
     try { $script:overlay.Close(); $script:overlay.Dispose() } catch {}
     try { $script:trayIcon.Visible = $false; $script:trayIcon.Dispose() } catch {}
     try { $script:mutex.ReleaseMutex() } catch {}
@@ -972,7 +927,7 @@ $script:hotkeyForm.Add_FormClosing({
 })
 
 # ============================================================================
-# 17. RUN
+# 15. RUN
 # ============================================================================
 
 if ($script:debugMode) {
@@ -980,7 +935,7 @@ if ($script:debugMode) {
     Write-Host "=== $($script:APP_NAME) v$($script:VERSION) ===" -ForegroundColor Cyan
     Write-Host "  Hotkey:   Numpad+ (toggle)" -ForegroundColor Gray
     Write-Host "  Language: $(if ($script:config.language) { $script:config.language } else { 'system default' })" -ForegroundColor Gray
-    Write-Host "  Engine:   System.Speech (local)" -ForegroundColor Gray
+    Write-Host "  Engine:   WinRT cloud (winwhisper-engine.exe)" -ForegroundColor Gray
     Write-Host ""
     Write-Host "  Press Numpad+ to start/stop dictation." -ForegroundColor White
     Write-Host "  Right-click tray icon for menu." -ForegroundColor White
