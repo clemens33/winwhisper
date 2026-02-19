@@ -43,13 +43,19 @@ class WinWhisperEngine
     static StringBuilder accumulated = new StringBuilder();
     static int resultCount = 0;
     static bool isListening = false;
+    static bool isStopping = false;
+    static bool sessionCompleted = false;
     static bool running = true;
+
+    const string VERSION = "0.2.0";
 
     [STAThread]
     static void Main()
     {
         try
         {
+            Console.Error.WriteLine("[engine] v" + VERSION + " starting");
+            Console.Error.Flush();
             Initialize();
             Emit("ready", null, null);
             MainLoop();
@@ -217,7 +223,7 @@ class WinWhisperEngine
         // Subscribe to events
         SubscribeEvents();
 
-        EmitStatus("initialized");
+        EmitStatus("initialized v" + VERSION);
     }
 
     static void SubscribeEvents()
@@ -269,6 +275,8 @@ class WinWhisperEngine
     {
         try
         {
+            Console.Error.WriteLine("[engine] OnResultGenerated fired");
+            Console.Error.Flush();
             dynamic args = eventArgs;
             string text = args.Result.Text;
             string confidence = args.Result.Confidence.ToString();
@@ -291,6 +299,8 @@ class WinWhisperEngine
     {
         try
         {
+            Console.Error.WriteLine("[engine] OnHypothesisGenerated fired");
+            Console.Error.Flush();
             dynamic args = eventArgs;
             string text = args.Hypothesis.Text;
             Emit("hypothesis", text, null);
@@ -305,9 +315,12 @@ class WinWhisperEngine
     {
         try
         {
+            Console.Error.WriteLine("[engine] OnSessionCompleted fired");
+            Console.Error.Flush();
             dynamic args = eventArgs;
             string status = args.Status.ToString();
             isListening = false;
+            sessionCompleted = true;
             EmitStatus("session_completed:" + status);
         }
         catch (Exception ex)
@@ -319,6 +332,26 @@ class WinWhisperEngine
     static void StartListening()
     {
         if (isListening) return;
+
+        // Wait for any pending stop to finish before starting
+        if (isStopping)
+        {
+            EmitStatus("waiting_for_stop");
+            int waitMs = 0;
+            while (isStopping && waitMs < 8000)
+            {
+                Application.DoEvents();
+                Thread.Sleep(10);
+                waitMs += 10;
+            }
+            if (isStopping)
+            {
+                EmitError("Timeout waiting for previous stop to complete");
+                isStopping = false;
+                return;
+            }
+        }
+
         accumulated.Clear();
         resultCount = 0;
 
@@ -354,7 +387,10 @@ class WinWhisperEngine
 
     static void StopListening()
     {
-        if (!isListening) return;
+        if (!isListening && !isStopping) return;
+
+        isStopping = true;
+        sessionCompleted = false;
 
         try
         {
@@ -362,7 +398,7 @@ class WinWhisperEngine
             var stopTask = (Task)asTaskAction.Invoke(null, new object[] { stopOp });
 
             // Pump messages while waiting for StopAsync
-            int timeout = 500; // 5 seconds max
+            int timeout = 800; // 8 seconds max
             while (!stopTask.IsCompleted && timeout > 0)
             {
                 Application.DoEvents();
@@ -377,6 +413,15 @@ class WinWhisperEngine
                     msg = stopTask.Exception.InnerException.Message;
                 EmitError("StopAsync: " + msg);
             }
+
+            // Pump messages until session_completed fires (delivers pending results)
+            int drain = 200; // 2 seconds max
+            while (!sessionCompleted && drain > 0)
+            {
+                Application.DoEvents();
+                Thread.Sleep(10);
+                drain--;
+            }
         }
         catch (Exception ex)
         {
@@ -384,6 +429,7 @@ class WinWhisperEngine
         }
 
         isListening = false;
+        isStopping = false;
 
         // Emit final accumulated text
         string finalText = accumulated.ToString();

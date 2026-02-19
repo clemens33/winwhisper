@@ -167,9 +167,11 @@ $script:engineEvents = $null
 
 # Engine state (updated by background reader)
 $script:isListening = $false
+$script:isStopping = $false
 $script:accumulatedText = ''
 $script:currentHypothesis = ''
 $script:lastStoppedText = $null
+$script:pendingDoublePress = $false
 $script:history = @()
 $script:lastHotkeyTime = [DateTime]::MinValue
 
@@ -187,6 +189,7 @@ function Start-Engine {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
 
     $script:engineProc = New-Object System.Diagnostics.Process
@@ -218,6 +221,18 @@ function Start-Engine {
         }
     }).AddArgument($script:engineProc.StandardOutput).AddArgument($script:engineEvents)
     $script:engineReaderHandle = $script:engineReader.BeginInvoke()
+
+    # Background stderr reader (diagnostic)
+    $script:engineStderr = [PowerShell]::Create()
+    $null = $script:engineStderr.AddScript({
+        param($stderr, $queue)
+        while ($true) {
+            $line = $stderr.ReadLine()
+            if ($line -eq $null) { break }
+            $queue.Enqueue("STDERR:$line")
+        }
+    }).AddArgument($script:engineProc.StandardError).AddArgument($script:engineEvents)
+    $script:engineStderrHandle = $script:engineStderr.BeginInvoke()
 
     Write-Log "Speech engine started (WinRT cloud)" "OK"
     return $true
@@ -575,6 +590,8 @@ function Start-Listening {
     $script:accumulatedText = ''
     $script:currentHypothesis = ''
     $script:lastStoppedText = $null
+    $script:isStopping = $false
+    $script:pendingDoublePress = $false
     Send-EngineCommand 'start'
     # isListening is set to true when we receive "listening" status from the engine
     # but set it immediately for UI responsiveness
@@ -583,21 +600,13 @@ function Start-Listening {
 }
 
 function Stop-Listening {
-    if (-not $script:isListening) { return "" }
+    if (-not $script:isListening) { return }
     $script:isListening = $false
+    $script:isStopping = $true
+    $script:lastStoppedText = $null
     Send-EngineCommand 'stop'
-    Write-Log "Stop sent to engine"
-
-    # Wait briefly for the "stopped" event with final text
-    $deadline = [DateTime]::UtcNow.AddSeconds(3)
-    while ([DateTime]::UtcNow -lt $deadline -and $script:lastStoppedText -eq $null) {
-        Start-Sleep -Milliseconds 50
-        Process-EngineEvents
-    }
-
-    $text = if ($script:lastStoppedText -ne $null) { $script:lastStoppedText } else { $script:accumulatedText }
-    Write-Log "Listening stopped. Text='$text'" "OK"
-    return $text
+    Write-Log "Stop sent to engine (async)"
+    # Text will be handled by Process-EngineEvents when 'stopped' arrives
 }
 
 function Add-History([string]$text) {
@@ -616,6 +625,11 @@ function Process-EngineEvents {
     if (-not $script:engineEvents) { return }
     $line = $null
     while ($script:engineEvents.TryDequeue([ref]$line)) {
+        # Handle stderr diagnostic lines
+        if ($line.StartsWith('STDERR:')) {
+            Write-Log "Engine stderr: $($line.Substring(7))"
+            continue
+        }
         try {
             $evt = $line | ConvertFrom-Json
             switch ($evt.type) {
@@ -634,6 +648,9 @@ function Process-EngineEvents {
                 'stopped' {
                     $script:lastStoppedText = $evt.text
                     Write-Log "Stopped: results=$($evt.results) text='$($evt.text)'"
+                    if ($script:isStopping) {
+                        Complete-Dictation
+                    }
                 }
                 'status' {
                     Write-Log "Engine status: $($evt.message)"
@@ -646,6 +663,59 @@ function Process-EngineEvents {
             Write-Log "Failed to parse engine event: $line" "WARN"
         }
     }
+}
+
+function Complete-Dictation {
+    $script:isStopping = $false
+    $text = if ($script:lastStoppedText) { $script:lastStoppedText } else { $script:accumulatedText }
+    Write-Log "Dictation complete. Text='$text'" "OK"
+
+    $script:trayIcon.Icon = New-TrayIcon "idle"
+    $script:trayIcon.Text = "$($script:APP_NAME) - Ready"
+    $script:menuStatus.Text = "Ready (Numpad+ to dictate)"
+
+    if ($text -and $text.Length -gt 0) {
+        $script:overlay.SetText("Done!")
+        $script:overlay.SetDotColor([System.Drawing.Color]::FromArgb(34, 197, 94))
+
+        Add-History $text
+
+        # Type text into focused field
+        [WinAPI]::TypeText($text)
+        Write-Log "Text typed: '$text'" "OK"
+
+        # Auto-Enter logic
+        $shouldEnter = [bool]$script:config.autoEnter -or $script:pendingDoublePress
+        if ($shouldEnter) {
+            $delay = 800
+            if ($script:config.autoEnterDelay) { $delay = $script:config.autoEnterDelay }
+
+            $enterTimer = New-Object System.Windows.Forms.Timer
+            $enterTimer.Interval = $delay
+            $enterTimer.Add_Tick({
+                $this.Stop()
+                $this.Dispose()
+                [WinAPI]::TypeEnter()
+                Write-Log "Enter sent" "OK"
+            })
+            $enterTimer.Start()
+        }
+    } else {
+        $script:overlay.SetText("No speech detected")
+        $script:overlay.SetDotColor([System.Drawing.Color]::Gray)
+    }
+
+    $script:pendingDoublePress = $false
+
+    # Hide overlay after brief display
+    $hideTimer = New-Object System.Windows.Forms.Timer
+    $hideTimer.Interval = 1500
+    $hideTimer.Add_Tick({
+        $this.Stop()
+        $this.Dispose()
+        $script:overlay.Hide()
+    })
+    $hideTimer.Start()
 }
 
 # ============================================================================
@@ -704,6 +774,7 @@ $script:overlay = New-Object OverlayForm
 # (runs on WinForms UI thread, so it works during Application.Run)
 $script:pollTimer = New-Object System.Windows.Forms.Timer
 $script:pollTimer.Interval = 100  # 100ms poll interval
+$script:stopSentTime = $null
 $script:pollTimer.Add_Tick({
     # Process engine events from background reader
     Process-EngineEvents
@@ -714,6 +785,18 @@ $script:pollTimer.Add_Tick({
         $acc = $script:accumulatedText
         $displayText = if ($acc -and $hyp) { "$acc $hyp..." } elseif ($hyp) { "$hyp..." } elseif ($acc) { $acc } else { "Listening..." }
         $script:overlay.SetText($displayText)
+    }
+
+    # Safety timeout: if stopping takes too long (10s), force complete
+    if ($script:isStopping) {
+        if (-not $script:stopSentTime) {
+            $script:stopSentTime = [DateTime]::UtcNow
+        } elseif (([DateTime]::UtcNow - $script:stopSentTime).TotalSeconds -gt 10) {
+            Write-Log "Stop timeout (10s) - forcing completion" "WARN"
+            Complete-Dictation
+        }
+    } else {
+        $script:stopSentTime = $null
     }
 })
 $script:pollTimer.Start()
@@ -727,9 +810,9 @@ $script:trayIcon.Visible = $true
 # Tray context menu
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
-$menuStatus = $menu.Items.Add("Ready (Numpad+ to dictate)")
-$menuStatus.Enabled = $false
-$menuStatus.Font = New-Object System.Drawing.Font($menuStatus.Font, [System.Drawing.FontStyle]::Bold)
+$script:menuStatus = $menu.Items.Add("Ready (Numpad+ to dictate)")
+$script:menuStatus.Enabled = $false
+$script:menuStatus.Font = New-Object System.Drawing.Font($script:menuStatus.Font, [System.Drawing.FontStyle]::Bold)
 
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
@@ -825,59 +908,19 @@ $script:hotkeyForm.Add_HotkeyPressed({
     }
     $isDoublePress = $doublePressEnabled -and ($timeSinceLast -lt $doublePressInterval) -and ($timeSinceLast -gt 50)
 
+    # Ignore hotkey while engine is finishing up
+    if ($script:isStopping) { return }
+
     if ($script:isListening) {
-        # === STOP ===
+        # === STOP (async — Complete-Dictation handles the rest) ===
         Write-Log "Stopping..."
 
         $script:overlay.SetText("Finishing...")
         $script:overlay.SetDotColor([System.Drawing.Color]::FromArgb(234, 179, 8))
+        $script:menuStatus.Text = "Finishing..."
 
-        $text = Stop-Listening
-
-        $script:trayIcon.Icon = New-TrayIcon "idle"
-        $script:trayIcon.Text = "$($script:APP_NAME) - Ready"
-        $menuStatus.Text = "Ready (Numpad+ to dictate)"
-
-        if ($text -and $text.Length -gt 0) {
-            $script:overlay.SetText("Done!")
-            $script:overlay.SetDotColor([System.Drawing.Color]::FromArgb(34, 197, 94))
-
-            Add-History $text
-
-            # Type text into focused field
-            [WinAPI]::TypeText($text)
-            Write-Log "Text typed: '$text'" "OK"
-
-            # Auto-Enter logic
-            $shouldEnter = [bool]$script:config.autoEnter -or $isDoublePress
-            if ($shouldEnter) {
-                $delay = 800
-                if ($script:config.autoEnterDelay) { $delay = $script:config.autoEnterDelay }
-
-                $enterTimer = New-Object System.Windows.Forms.Timer
-                $enterTimer.Interval = $delay
-                $enterTimer.Add_Tick({
-                    $this.Stop()
-                    $this.Dispose()
-                    [WinAPI]::TypeEnter()
-                    Write-Log "Enter sent" "OK"
-                })
-                $enterTimer.Start()
-            }
-        } else {
-            $script:overlay.SetText("No speech detected")
-            $script:overlay.SetDotColor([System.Drawing.Color]::Gray)
-        }
-
-        # Hide overlay after brief display
-        $hideTimer = New-Object System.Windows.Forms.Timer
-        $hideTimer.Interval = 1500
-        $hideTimer.Add_Tick({
-            $this.Stop()
-            $this.Dispose()
-            $script:overlay.Hide()
-        })
-        $hideTimer.Start()
+        $script:pendingDoublePress = $isDoublePress
+        Stop-Listening
 
     } else {
         # === START ===
@@ -891,7 +934,7 @@ $script:hotkeyForm.Add_HotkeyPressed({
 
         $script:trayIcon.Icon = New-TrayIcon "recording"
         $script:trayIcon.Text = "$($script:APP_NAME) - Listening..."
-        $menuStatus.Text = "Listening... (Numpad+ to stop)"
+        $script:menuStatus.Text = "Listening... (Numpad+ to stop)"
 
         if ($isDoublePress) {
             Write-Log "Double-press detected (will auto-Enter on stop)"
@@ -919,7 +962,7 @@ function Exit-App {
     try { $script:mutex.ReleaseMutex() } catch {}
 
     Write-Log "Goodbye!" "OK"
-    [System.Windows.Forms.Application]::Exit()
+    $script:appRunning = $false
 }
 
 $script:hotkeyForm.Add_FormClosing({
@@ -934,7 +977,8 @@ if ($script:debugMode) {
     Write-Host ""
     Write-Host "=== $($script:APP_NAME) v$($script:VERSION) ===" -ForegroundColor Cyan
     Write-Host "  Hotkey:   Numpad+ (toggle)" -ForegroundColor Gray
-    Write-Host "  Language: $(if ($script:config.language) { $script:config.language } else { 'system default' })" -ForegroundColor Gray
+    $lang = if ($script:config.language) { $script:config.language } else { 'system default' }
+    Write-Host "  Language: $lang" -ForegroundColor Gray
     Write-Host "  Engine:   WinRT cloud (winwhisper-engine.exe)" -ForegroundColor Gray
     Write-Host ""
     Write-Host "  Press Numpad+ to start/stop dictation." -ForegroundColor White
@@ -949,5 +993,10 @@ $script:trayIcon.ShowBalloonTip(
     [System.Windows.Forms.ToolTipIcon]::Info
 )
 
-# Run the message loop
-[System.Windows.Forms.Application]::Run($script:hotkeyForm)
+# Run the message loop (DoEvents instead of Application.Run to avoid
+# interfering with child engine's WinRT speech recognition)
+$script:appRunning = $true
+while ($script:appRunning) {
+    [System.Windows.Forms.Application]::DoEvents()
+    Start-Sleep -Milliseconds 10
+}
