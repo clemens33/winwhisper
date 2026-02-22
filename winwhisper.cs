@@ -8,14 +8,18 @@ using System.Threading;
 using System.Threading.Tasks;
 
 /// <summary>
-/// WinWhisper v0.7.0 — Push-to-talk voice dictation for Windows 11.
-/// Pure Win32 API (no WinForms) — WinRT speech + Shell_NotifyIcon tray + SendInput.
+/// WinWhisper v0.9.0 — Push-to-talk voice dictation for Windows 11.
+/// Pure Win32 API (no WinForms) — WinRT speech + tray icon + live overlay + SendInput.
+/// Compile with /target:winexe for no console. Use -debug for console logging.
 /// </summary>
 class WinWhisper
 {
-    const string VERSION = "0.8.0";
+    const string VERSION = "0.9.0";
     const int VK_OEM_PLUS = 0xBB;
+    const int VK_ADD = 0x6B;       // Numpad +
+    const int VK_SHIFT = 0x10;
     const int VK_ESCAPE = 0x1B;
+    const int DEBOUNCE_MS = 200;
 
     // --- Win32 constants ---
     const uint PM_REMOVE = 0x0001;
@@ -42,7 +46,6 @@ class WinWhisper
 
     // Overlay window constants
     const uint WS_POPUP = 0x80000000;
-    const uint WS_VISIBLE = 0x10000000;
     const uint WS_EX_LAYERED = 0x80000;
     const uint WS_EX_TOPMOST = 0x00000008;
     const uint WS_EX_TRANSPARENT = 0x00000020;
@@ -53,6 +56,13 @@ class WinWhisper
     const int OVERLAY_TIMER_ID = 42;
     const int OVERLAY_WIDTH = 340;
     const int OVERLAY_HEIGHT = 44;
+
+    // Overlay dot colors (BGR format)
+    const uint DOT_RED = 0x004444EF;      // Recording
+    const uint DOT_AMBER = 0x0008B3EA;    // Processing
+    const uint DOT_GREEN = 0x005EC522;    // Success
+    const uint DOT_GRAY = 0x00808080;     // No speech
+    const uint DOT_ERROR = 0x000000FF;    // Error
 
     // --- P/Invoke: message pump + keyboard ---
 
@@ -67,6 +77,11 @@ class WinWhisper
 
     [DllImport("user32.dll")]
     static extern IntPtr DispatchMessage(ref MSG lpMsg);
+
+    // --- P/Invoke: console (for -debug mode with /target:winexe) ---
+
+    [DllImport("kernel32.dll")]
+    static extern bool AllocConsole();
 
     // --- P/Invoke: SendInput ---
 
@@ -332,25 +347,30 @@ class WinWhisper
     static object recognizer;
     static object session;
 
-    // --- Speech state ---
+    // --- Speech state (accessed from background threads) ---
+    static readonly object accLock = new object();
     static StringBuilder accumulated = new StringBuilder();
     static int resultCount = 0;
     static bool isListening = false;
     static bool isStopping = false;
     static bool sessionCompleted = false;
+    static string currentHypothesis = "";
+    static int hypothesisVersion = 0;
 
     // --- App state ---
     static bool running = true;
+    static bool debugMode = false;
     static IntPtr trayHwnd = IntPtr.Zero;
     static IntPtr iconIdle = IntPtr.Zero;
     static IntPtr iconRecording = IntPtr.Zero;
-    static WndProcDelegate wndProcDelegate; // prevent GC collection
+    static WndProcDelegate wndProcDelegate;
+    static DateTime lastHotkeyTime = DateTime.MinValue;
 
     // --- Overlay state ---
     static IntPtr overlayHwnd = IntPtr.Zero;
-    static WndProcDelegate overlayWndProcDelegate; // prevent GC
+    static WndProcDelegate overlayWndProcDelegate;
     static string overlayText = "";
-    static uint overlayDotColor = 0x0045EF; // BGR red
+    static uint overlayDotColor = DOT_RED;
     static IntPtr overlayFont = IntPtr.Zero;
 
     // =======================================================================
@@ -359,11 +379,17 @@ class WinWhisper
 
     static void Main(string[] args)
     {
+        debugMode = Array.Exists(args, a =>
+            a.Equals("-debug", StringComparison.OrdinalIgnoreCase) ||
+            a.Equals("--debug", StringComparison.OrdinalIgnoreCase));
+
+        if (debugMode) AllocConsole();
+
         bool created;
         var mutex = new Mutex(false, "WinWhisper_SingleInstance", out created);
         if (!mutex.WaitOne(0, false))
         {
-            Console.WriteLine("[ERROR] WinWhisper is already running.");
+            Log("WinWhisper is already running.", "ERROR");
             return;
         }
 
@@ -371,82 +397,90 @@ class WinWhisper
         {
             Log("Starting WinWhisper v" + VERSION);
 
-            // Initialize speech engine
             InitializeSpeech();
             Log("Speech engine initialized", "OK");
 
-            // Create tray icon (pure Win32, no WinForms)
             InitializeTray();
             Log("Tray icon ready", "OK");
 
-            // Create overlay window (pure Win32, hidden until needed)
             InitializeOverlay();
             Log("Overlay ready", "OK");
 
-            Console.WriteLine();
-            Console.WriteLine("=== WinWhisper v" + VERSION + " ===");
-            Console.WriteLine("  Hotkey:   + key (toggle recording)");
-            Console.WriteLine("  Quit:     Escape, Ctrl+C, or right-click tray > Exit");
-            Console.WriteLine("  Engine:   WinRT cloud (pure Win32, no WinForms)");
-            Console.WriteLine();
+            if (debugMode)
+            {
+                Console.WriteLine();
+                Console.WriteLine("=== WinWhisper v" + VERSION + " ===");
+                Console.WriteLine("  Hotkey:   Shift + = (the + key)");
+                Console.WriteLine("  Quit:     Escape, Ctrl+C, or right-click tray > Exit");
+                Console.WriteLine("  Engine:   WinRT cloud (pure Win32, no WinForms)");
+                Console.WriteLine();
+            }
 
-            ShowBalloon("WinWhisper", "Press + to start voice dictation.");
+            ShowBalloon("WinWhisper", "Press Shift+= (+) to start voice dictation.");
 
             // Main loop
-            bool prevAdd = false;
+            bool prevHotkey = false;
             bool prevEsc = false;
+            int lastHypVer = 0;
+            int lastResultVer = 0;
 
             while (running)
             {
                 PumpMessages();
                 Thread.Sleep(10);
 
-                // Poll + key
-                bool addDown = (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) != 0;
-                if (addDown && !prevAdd)
+                // Update overlay with live hypothesis during recording
+                if (isListening)
                 {
-                    if (isStopping)
+                    int hv = hypothesisVersion;
+                    int rv = resultCount;
+                    if (hv != lastHypVer || rv != lastResultVer)
                     {
-                        // Ignore while stopping
-                    }
-                    else if (isListening)
-                    {
-                        Log("Stopping...");
-                        UpdateTray(false, "WinWhisper - Processing...");
-                        StopListening();
-                        string text = accumulated.ToString();
-                        Log("Stopped: " + resultCount + " results, text='" + text + "'");
-                        UpdateTray(false, "WinWhisper - Ready");
-                        if (!string.IsNullOrEmpty(text))
-                        {
-                            ShowOverlay(text, 0x005EC522); // Green dot BGR
-                            TypeText(text);
-                            Log("Typed: '" + text + "'", "OK");
-                        }
-                        else
-                        {
-                            ShowOverlay("No speech detected", 0x00808080); // Gray dot
-                        }
-                    }
-                    else
-                    {
-                        Log("Starting...");
-                        UpdateTray(true, "WinWhisper - Listening...");
-                        StartListening();
+                        lastHypVer = hv;
+                        lastResultVer = rv;
+                        string acc;
+                        lock (accLock) { acc = accumulated.ToString(); }
+                        string hyp = currentHypothesis;
+
+                        string display;
+                        if (acc.Length > 0 && hyp.Length > 0) display = acc + " " + hyp + "...";
+                        else if (hyp.Length > 0) display = hyp + "...";
+                        else if (acc.Length > 0) display = acc;
+                        else display = "Listening...";
+
+                        UpdateOverlayContent(display, DOT_RED);
                     }
                 }
-                prevAdd = addDown;
 
-                // Poll Escape
-                bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-                if (escDown && !prevEsc) running = false;
-                prevEsc = escDown;
+                // Poll + key: either Shift+= (keyboard +) or Numpad+
+                bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                bool oemPlusDown = (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) != 0;
+                bool numpadPlusDown = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0;
+                bool hotkeyDown = (shiftDown && oemPlusDown) || numpadPlusDown;
+                if (hotkeyDown && !prevHotkey)
+                {
+                    var now = DateTime.Now;
+                    if ((now - lastHotkeyTime).TotalMilliseconds > DEBOUNCE_MS)
+                    {
+                        lastHotkeyTime = now;
+                        HandleHotkey();
+                    }
+                }
+                prevHotkey = hotkeyDown;
+
+                // Poll Escape (debug mode only)
+                if (debugMode)
+                {
+                    bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+                    if (escDown && !prevEsc) running = false;
+                    prevEsc = escDown;
+                }
             }
         }
         catch (Exception ex)
         {
             Log("Fatal: " + ex.Message, "ERROR");
-            Console.WriteLine(ex.StackTrace);
+            if (debugMode) Console.WriteLine(ex.StackTrace);
         }
         finally
         {
@@ -456,6 +490,50 @@ class WinWhisper
             CleanupTray();
             mutex.ReleaseMutex();
             Log("Goodbye!", "OK");
+        }
+    }
+
+    static void HandleHotkey()
+    {
+        if (isStopping) return;
+
+        if (isListening)
+        {
+            // STOP
+            Log("Stopping...");
+            UpdateTray(false, "WinWhisper - Processing...");
+            ShowOverlayPersistent("Processing...", DOT_AMBER);
+            StopListening();
+
+            string text;
+            lock (accLock) { text = accumulated.ToString(); }
+            Log("Stopped: " + resultCount + " results, text='" + text + "'");
+            UpdateTray(false, "WinWhisper - Ready");
+
+            if (!string.IsNullOrEmpty(text))
+            {
+                ShowOverlayAutoHide(text, DOT_GREEN);
+                TypeText(text);
+                Log("Typed: '" + text + "'", "OK");
+            }
+            else
+            {
+                ShowOverlayAutoHide("No speech detected", DOT_GRAY);
+            }
+        }
+        else
+        {
+            // START
+            Log("Starting...");
+            UpdateTray(true, "WinWhisper - Listening...");
+            ShowOverlayPersistent("Listening...", DOT_RED);
+            StartListening();
+            if (!isListening)
+            {
+                // StartListening failed
+                UpdateTray(false, "WinWhisper - Error");
+                ShowOverlayAutoHide("Failed to start speech", DOT_ERROR);
+            }
         }
     }
 
@@ -475,11 +553,9 @@ class WinWhisper
 
     static void InitializeTray()
     {
-        // Create icons
-        iconIdle = CreateCircleIcon(128, 128, 128);      // Gray
-        iconRecording = CreateCircleIcon(239, 68, 68);    // Red
+        iconIdle = CreateCircleIcon(128, 128, 128);
+        iconRecording = CreateCircleIcon(239, 68, 68);
 
-        // Register window class for message-only window
         IntPtr hInstance = GetModuleHandle(null);
         wndProcDelegate = new WndProcDelegate(TrayWndProc);
 
@@ -490,12 +566,10 @@ class WinWhisper
         wc.lpszClassName = "WinWhisperTray";
         RegisterClassEx(ref wc);
 
-        // Create message-only window (HWND_MESSAGE = -3)
         IntPtr HWND_MESSAGE = new IntPtr(-3);
         trayHwnd = CreateWindowEx(0, "WinWhisperTray", "WinWhisper", 0,
             0, 0, 0, 0, HWND_MESSAGE, IntPtr.Zero, hInstance, IntPtr.Zero);
 
-        // Add tray icon
         NOTIFYICONDATA nid = new NOTIFYICONDATA();
         nid.cbSize = Marshal.SizeOf(typeof(NOTIFYICONDATA));
         nid.hWnd = trayHwnd;
@@ -581,10 +655,9 @@ class WinWhisper
         AppendMenu(hMenu, MF_SEPARATOR, 0, null);
         AppendMenu(hMenu, MF_STRING, (uint)MENU_EXIT, "Exit");
 
-        // Required: SetForegroundWindow before TrackPopupMenu, then post WM_NULL after
         SetForegroundWindow(hWnd);
         TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_RIGHTALIGN, pt.x, pt.y, 0, hWnd, IntPtr.Zero);
-        PostMessage(hWnd, 0, IntPtr.Zero, IntPtr.Zero); // WM_NULL
+        PostMessage(hWnd, 0, IntPtr.Zero, IntPtr.Zero);
 
         DestroyMenu(hMenu);
     }
@@ -605,7 +678,6 @@ class WinWhisper
         wc.lpszClassName = "WinWhisperOverlay";
         RegisterClassEx(ref wc);
 
-        // Position near tray (bottom-right of work area)
         RECT workArea;
         SystemParametersInfo(SPI_GETWORKAREA, 0, out workArea, 0);
         int ox = workArea.right - OVERLAY_WIDTH - 12;
@@ -615,21 +687,28 @@ class WinWhisper
         overlayHwnd = CreateWindowEx(exStyle, "WinWhisperOverlay", "", WS_POPUP,
             ox, oy, OVERLAY_WIDTH, OVERLAY_HEIGHT, IntPtr.Zero, IntPtr.Zero, hInstance, IntPtr.Zero);
 
-        // Set opacity (235/255 ~ 92%)
         SetLayeredWindowAttributes(overlayHwnd, 0, 235, LWA_ALPHA);
-
-        // Create font
         overlayFont = CreateFont(-14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 5, 0, "Segoe UI");
     }
 
-    static void ShowOverlay(string text, uint dotColorBGR)
+    static void UpdateOverlayContent(string text, uint dotColorBGR)
     {
         overlayText = text;
         overlayDotColor = dotColorBGR;
         InvalidateRect(overlayHwnd, IntPtr.Zero, true);
-        ShowWindow(overlayHwnd, 8); // SW_SHOWNA (show without activating)
+    }
 
-        // Auto-hide after 2 seconds
+    static void ShowOverlayPersistent(string text, uint dotColorBGR)
+    {
+        KillTimer(overlayHwnd, new IntPtr(OVERLAY_TIMER_ID));
+        UpdateOverlayContent(text, dotColorBGR);
+        ShowWindow(overlayHwnd, 8); // SW_SHOWNA
+    }
+
+    static void ShowOverlayAutoHide(string text, uint dotColorBGR)
+    {
+        UpdateOverlayContent(text, dotColorBGR);
+        ShowWindow(overlayHwnd, 8); // SW_SHOWNA
         KillTimer(overlayHwnd, new IntPtr(OVERLAY_TIMER_ID));
         SetTimer(overlayHwnd, new IntPtr(OVERLAY_TIMER_ID), 2000, IntPtr.Zero);
     }
@@ -653,8 +732,7 @@ class WinWhisper
             PAINTSTRUCT ps;
             IntPtr hdc = BeginPaint(hWnd, out ps);
 
-            // Background: dark gray
-            IntPtr bgBrush = CreateSolidBrush(0x001E1E1E); // BGR
+            IntPtr bgBrush = CreateSolidBrush(0x001E1E1E);
             RECT clientRect;
             clientRect.left = 0;
             clientRect.top = 0;
@@ -663,9 +741,8 @@ class WinWhisper
             FillRect(hdc, ref clientRect, bgBrush);
             DeleteObject(bgBrush);
 
-            // Dot indicator (colored circle)
             IntPtr dotBrush = CreateSolidBrush(overlayDotColor);
-            IntPtr dotPen = CreatePen(0, 1, overlayDotColor); // PS_SOLID
+            IntPtr dotPen = CreatePen(0, 1, overlayDotColor);
             IntPtr oldBrush = SelectObject(hdc, dotBrush);
             IntPtr oldPen = SelectObject(hdc, dotPen);
             Ellipse(hdc, 12, 15, 24, 27);
@@ -674,9 +751,8 @@ class WinWhisper
             DeleteObject(dotBrush);
             DeleteObject(dotPen);
 
-            // Text
             IntPtr oldFont = SelectObject(hdc, overlayFont);
-            SetTextColor(hdc, 0x00DCDCDC); // Light gray BGR
+            SetTextColor(hdc, 0x00DCDCDC);
             SetBkMode(hdc, TRANSPARENT);
             RECT textRect;
             textRect.left = 32;
@@ -704,8 +780,8 @@ class WinWhisper
     static IntPtr CreateCircleIcon(byte r, byte g, byte b)
     {
         int size = 16;
-        byte[] pixels = new byte[size * size * 4]; // 32bpp BGRA, bottom-up
-        int maskStride = ((size + 31) / 32) * 4;   // DWORD-aligned row for 1bpp
+        byte[] pixels = new byte[size * size * 4];
+        int maskStride = ((size + 31) / 32) * 4;
         byte[] mask = new byte[maskStride * size];
 
         int cx = size / 2, cy = size / 2;
@@ -713,22 +789,20 @@ class WinWhisper
 
         for (int y = 0; y < size; y++)
         {
-            int by = size - 1 - y; // bottom-up for color bitmap
+            int by = size - 1 - y;
             for (int x = 0; x < size; x++)
             {
                 int dx = x - cx, dy = y - cy;
                 if (dx * dx + dy * dy <= rad * rad)
                 {
                     int pi = (by * size + x) * 4;
-                    pixels[pi + 0] = b;   // Blue
-                    pixels[pi + 1] = g;   // Green
-                    pixels[pi + 2] = r;   // Red
-                    pixels[pi + 3] = 255; // Alpha
-                    // mask bit stays 0 = opaque
+                    pixels[pi + 0] = b;
+                    pixels[pi + 1] = g;
+                    pixels[pi + 2] = r;
+                    pixels[pi + 3] = 255;
                 }
                 else
                 {
-                    // Transparent: set mask bit to 1
                     int mi = by * maskStride + x / 8;
                     mask[mi] |= (byte)(0x80 >> (x % 8));
                 }
@@ -739,7 +813,7 @@ class WinWhisper
         IntPtr hbmMask = CreateBitmap(size, size, 1, 1, mask);
 
         ICONINFO ii = new ICONINFO();
-        ii.fIcon = 1; // TRUE
+        ii.fIcon = 1;
         ii.hbmColor = hbmColor;
         ii.hbmMask = hbmMask;
 
@@ -786,7 +860,6 @@ class WinWhisper
 
         recognizer = Activator.CreateInstance(recType);
 
-        // Add dictation constraint
         try
         {
             object dictationScenario = Enum.Parse(scenarioType, "Dictation");
@@ -806,7 +879,6 @@ class WinWhisper
         }
         catch { }
 
-        // Compile
         object compileOp = ((dynamic)recognizer).CompileConstraintsAsync();
         var compileTask = (Task)asTaskOperation
             .MakeGenericMethod(compileResultType)
@@ -818,7 +890,6 @@ class WinWhisper
 
         session = ((dynamic)recognizer).ContinuousRecognitionSession;
 
-        // Subscribe events
         var resultEvent = sessionType.GetEvent("ResultGenerated");
         if (resultEvent != null)
         {
@@ -854,9 +925,11 @@ class WinWhisper
             if (isStopping) { isStopping = false; return; }
         }
 
-        accumulated.Clear();
+        lock (accLock) { accumulated.Clear(); }
         resultCount = 0;
         sessionCompleted = false;
+        currentHypothesis = "";
+        hypothesisVersion = 0;
 
         try
         {
@@ -889,7 +962,6 @@ class WinWhisper
             int timeout = 800;
             while (!stopTask.IsCompleted && timeout > 0) { PumpMessages(); Thread.Sleep(10); timeout--; }
 
-            // Drain pending callbacks
             int drain = 200;
             while (!sessionCompleted && drain > 0) { PumpMessages(); Thread.Sleep(10); drain--; }
         }
@@ -899,7 +971,7 @@ class WinWhisper
         isStopping = false;
     }
 
-    // --- WinRT event callbacks ---
+    // --- WinRT event callbacks (called from background threads) ---
 
     static void OnResultGenerated(object sender, object eventArgs)
     {
@@ -909,9 +981,13 @@ class WinWhisper
             string text = args.Result.Text;
             if (!string.IsNullOrWhiteSpace(text))
             {
-                if (accumulated.Length > 0) accumulated.Append(" ");
-                accumulated.Append(text);
+                lock (accLock)
+                {
+                    if (accumulated.Length > 0) accumulated.Append(" ");
+                    accumulated.Append(text);
+                }
                 Interlocked.Increment(ref resultCount);
+                currentHypothesis = "";
                 Log("Result: " + text);
             }
         }
@@ -924,6 +1000,8 @@ class WinWhisper
         {
             dynamic args = eventArgs;
             string text = args.Hypothesis.Text;
+            currentHypothesis = text;
+            Interlocked.Increment(ref hypothesisVersion);
             Log("Hypothesis: " + text);
         }
         catch { }
@@ -983,6 +1061,7 @@ class WinWhisper
 
     static void Log(string msg, string level)
     {
+        if (!debugMode) return;
         string prefix = level == "OK" ? "[OK] " : level == "ERROR" ? "[ERROR] " : "[INFO] ";
         string time = DateTime.Now.ToString("HH:mm:ss.fff");
         Console.WriteLine("[" + time + "] " + prefix + msg);
