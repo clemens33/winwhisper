@@ -400,6 +400,20 @@ class WinWhisper
             InitializeSpeech();
             Log("Speech engine initialized", "OK");
 
+            // Warm up cloud connection: quick start+stop cycle
+            try
+            {
+                Log("Warming up cloud connection...");
+                object warmOp = ((dynamic)session).StartAsync();
+                var warmTask = (Task)asTaskAction.Invoke(null, new object[] { warmOp });
+                while (!warmTask.IsCompleted) { Thread.Sleep(10); }
+                object stopWarmOp = ((dynamic)session).StopAsync();
+                var stopWarmTask = (Task)asTaskAction.Invoke(null, new object[] { stopWarmOp });
+                while (!stopWarmTask.IsCompleted) { Thread.Sleep(10); }
+                Log("Cloud connection warm", "OK");
+            }
+            catch (Exception ex) { Log("Warmup: " + ex.Message); }
+
             InitializeTray();
             Log("Tray icon ready", "OK");
 
@@ -979,13 +993,24 @@ class WinWhisper
         {
             object stopOp = ((dynamic)session).StopAsync();
             var stopTask = (Task)asTaskAction.Invoke(null, new object[] { stopOp });
-            int timeout = 800;
+            int timeout = 300; // 3 seconds max for StopAsync
             while (!stopTask.IsCompleted && timeout > 0) { PumpMessages(); Thread.Sleep(10); timeout--; }
 
-            int drain = 200;
+            int drain = 200; // 2 seconds to drain final Result events
             while (!sessionCompleted && drain > 0) { PumpMessages(); Thread.Sleep(10); drain--; }
         }
         catch (Exception ex) { Log("Stop: " + ex.Message, "ERROR"); }
+
+        // Fallback: if no Result fired but we had hypothesis text, use it
+        lock (accLock)
+        {
+            if (accumulated.Length == 0 && !string.IsNullOrEmpty(currentHypothesis))
+            {
+                accumulated.Append(currentHypothesis);
+                Interlocked.Increment(ref resultCount);
+                Log("Using last hypothesis as fallback: " + currentHypothesis);
+            }
+        }
 
         isListening = false;
         isStopping = false;
