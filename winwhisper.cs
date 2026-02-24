@@ -993,10 +993,10 @@ class WinWhisper
         {
             object stopOp = ((dynamic)session).StopAsync();
             var stopTask = (Task)asTaskAction.Invoke(null, new object[] { stopOp });
-            int timeout = 300; // 3 seconds max for StopAsync
+            int timeout = 150; // 1.5s max for StopAsync (results arrive within ~100ms)
             while (!stopTask.IsCompleted && timeout > 0) { PumpMessages(); Thread.Sleep(10); timeout--; }
 
-            int drain = 200; // 2 seconds to drain final Result events
+            int drain = 100; // 1s to drain final Result events
             while (!sessionCompleted && drain > 0) { PumpMessages(); Thread.Sleep(10); drain--; }
         }
         catch (Exception ex) { Log("Stop: " + ex.Message, "ERROR"); }
