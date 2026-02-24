@@ -519,6 +519,7 @@ class WinWhisper
             else
             {
                 ShowOverlayAutoHide("No speech detected", DOT_GRAY);
+                ResetSpeech();
             }
         }
         else
@@ -931,22 +932,41 @@ class WinWhisper
         currentHypothesis = "";
         hypothesisVersion = 0;
 
-        try
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            object startOp = ((dynamic)session).StartAsync();
-            var startTask = (Task)asTaskAction.Invoke(null, new object[] { startOp });
-            while (!startTask.IsCompleted) { PumpMessages(); Thread.Sleep(10); }
-            if (startTask.IsFaulted)
+            try
             {
-                string msg = startTask.Exception != null && startTask.Exception.InnerException != null
-                    ? startTask.Exception.InnerException.Message : "StartAsync failed";
-                Log("StartAsync: " + msg, "ERROR");
+                object startOp = ((dynamic)session).StartAsync();
+                var startTask = (Task)asTaskAction.Invoke(null, new object[] { startOp });
+                while (!startTask.IsCompleted) { PumpMessages(); Thread.Sleep(10); }
+                if (startTask.IsFaulted)
+                {
+                    string msg = startTask.Exception != null && startTask.Exception.InnerException != null
+                        ? startTask.Exception.InnerException.Message : "StartAsync failed";
+                    Log("StartAsync: " + msg, "ERROR");
+                    if (attempt == 0) { ResetSpeech(); continue; }
+                    return;
+                }
+                isListening = true;
+                Log("Listening started", "OK");
                 return;
             }
-            isListening = true;
-            Log("Listening started", "OK");
+            catch (Exception ex)
+            {
+                Log("Start: " + ex.Message, "ERROR");
+                if (attempt == 0) { ResetSpeech(); continue; }
+            }
         }
-        catch (Exception ex) { Log("Start: " + ex.Message, "ERROR"); }
+    }
+
+    static void ResetSpeech()
+    {
+        Log("Resetting speech engine...");
+        try { ((dynamic)recognizer).Dispose(); } catch { }
+        isListening = false;
+        isStopping = false;
+        try { InitializeSpeech(); Log("Speech engine re-initialized", "OK"); }
+        catch (Exception ex) { Log("ResetSpeech: " + ex.Message, "ERROR"); }
     }
 
     static void StopListening()
