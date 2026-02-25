@@ -417,14 +417,14 @@ class WinWhisper
             InitializeSpeech();
             Log("Speech engine initialized", "OK");
 
-            // Warm up cloud connection, then recreate engine fresh
+            // Warm up cloud connection (keep the same engine — don't recreate)
             try
             {
                 Log("Warming up cloud connection...");
                 object warmOp = ((dynamic)session).StartAsync();
                 var warmTask = (Task)asTaskAction.Invoke(null, new object[] { warmOp });
                 while (!warmTask.IsCompleted) { Thread.Sleep(10); }
-                Thread.Sleep(2000);
+                Thread.Sleep(1500);
                 object stopWarmOp = ((dynamic)session).StopAsync();
                 var stopWarmTask = (Task)asTaskAction.Invoke(null, new object[] { stopWarmOp });
                 while (!stopWarmTask.IsCompleted) { Thread.Sleep(10); }
@@ -432,10 +432,6 @@ class WinWhisper
                 Log("Cloud connection warm", "OK");
             }
             catch (Exception ex) { Log("Warmup: " + ex.Message); }
-
-            // Recreate engine so first real session gets a fresh recognizer
-            try { ((dynamic)recognizer).Dispose(); } catch { }
-            InitializeSpeech();
             Log("Speech engine ready", "OK");
 
             InitializeTray();
@@ -554,6 +550,9 @@ class WinWhisper
         }
     }
 
+    static int emptyRetries = 0;
+    const int MAX_EMPTY_RETRIES = 2;
+
     static void HandleHotkey()
     {
         if (isStopping) return;
@@ -569,16 +568,35 @@ class WinWhisper
             string text;
             lock (accLock) { text = accumulated.ToString(); }
             Log("Stopped: " + resultCount + " results, text='" + text + "'");
-            UpdateTray(false, "WinWhisper - Ready");
 
             if (!string.IsNullOrEmpty(text))
             {
+                emptyRetries = 0;
+                UpdateTray(false, "WinWhisper - Ready");
                 ShowOverlayAutoHide(text, DOT_GREEN);
                 TypeText(text);
                 Log("Typed: '" + text + "'", "OK");
             }
+            else if (emptyRetries < MAX_EMPTY_RETRIES)
+            {
+                // Auto-retry: session produced nothing, restart transparently
+                emptyRetries++;
+                Log("Empty session, auto-retry " + emptyRetries + "/" + MAX_EMPTY_RETRIES);
+                ResetSpeech();
+                UpdateTray(true, "WinWhisper - Listening...");
+                ShowOverlayPersistent("Listening...", DOT_RED);
+                StartListening();
+                if (!isListening)
+                {
+                    emptyRetries = 0;
+                    UpdateTray(false, "WinWhisper - Error");
+                    ShowOverlayAutoHide("Failed to start speech", DOT_ERROR);
+                }
+            }
             else
             {
+                emptyRetries = 0;
+                UpdateTray(false, "WinWhisper - Ready");
                 ShowOverlayAutoHide("No speech detected", DOT_GRAY);
                 ResetSpeech();
             }
@@ -586,6 +604,7 @@ class WinWhisper
         else
         {
             // START
+            emptyRetries = 0;
             Log("Starting...");
             UpdateTray(true, "WinWhisper - Listening...");
             ShowOverlayPersistent("Listening...", DOT_RED);
@@ -950,6 +969,17 @@ class WinWhisper
         if (compileResult.Status.ToString() != "Success")
             throw new Exception("CompileConstraintsAsync failed: " + compileResult.Status);
 
+        // Set generous timeouts to prevent mid-speech cancellation
+        try
+        {
+            dynamic timeouts = ((dynamic)recognizer).Timeouts;
+            timeouts.BabbleTimeout = TimeSpan.FromMinutes(5);
+            timeouts.InitialSilenceTimeout = TimeSpan.FromSeconds(30);
+            timeouts.EndSilenceTimeout = TimeSpan.FromSeconds(5);
+            Log("Timeouts set: babble=5min, silence=30s, end=5s");
+        }
+        catch (Exception ex) { Log("Timeouts: " + ex.Message); }
+
         session = ((dynamic)recognizer).ContinuousRecognitionSession;
 
         var resultEvent = sessionType.GetEvent("ResultGenerated");
@@ -1123,6 +1153,14 @@ class WinWhisper
         {
             dynamic args = eventArgs;
             string status = args.Status.ToString();
+
+            // Ignore stale events from previous sessions
+            if (!isListening && !isStopping)
+            {
+                Log("Session completed (STALE, ignored): " + status);
+                return;
+            }
+
             bool wasListening = isListening && !isStopping;
             isListening = false;
             sessionCompleted = true;
