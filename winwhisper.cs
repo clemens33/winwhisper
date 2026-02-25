@@ -279,7 +279,20 @@ class WinWhisper
     struct INPUTUNION
     {
         [FieldOffset(0)]
+        public MOUSEINPUT mi;
+        [FieldOffset(0)]
         public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -354,6 +367,7 @@ class WinWhisper
     static bool isListening = false;
     static bool isStopping = false;
     static bool sessionCompleted = false;
+    static bool needsReset = false;
     static string currentHypothesis = "";
     static int hypothesisVersion = 0;
 
@@ -383,6 +397,9 @@ class WinWhisper
             a.Equals("-debug", StringComparison.OrdinalIgnoreCase) ||
             a.Equals("--debug", StringComparison.OrdinalIgnoreCase));
 
+        logFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "winwhisper.log");
+        try { System.IO.File.WriteAllText(logFile, ""); } catch { } // truncate on start
+
         if (debugMode) AllocConsole();
 
         bool created;
@@ -400,19 +417,26 @@ class WinWhisper
             InitializeSpeech();
             Log("Speech engine initialized", "OK");
 
-            // Warm up cloud connection: quick start+stop cycle
+            // Warm up cloud connection, then recreate engine fresh
             try
             {
                 Log("Warming up cloud connection...");
                 object warmOp = ((dynamic)session).StartAsync();
                 var warmTask = (Task)asTaskAction.Invoke(null, new object[] { warmOp });
                 while (!warmTask.IsCompleted) { Thread.Sleep(10); }
+                Thread.Sleep(2000);
                 object stopWarmOp = ((dynamic)session).StopAsync();
                 var stopWarmTask = (Task)asTaskAction.Invoke(null, new object[] { stopWarmOp });
                 while (!stopWarmTask.IsCompleted) { Thread.Sleep(10); }
+                Thread.Sleep(500);
                 Log("Cloud connection warm", "OK");
             }
             catch (Exception ex) { Log("Warmup: " + ex.Message); }
+
+            // Recreate engine so first real session gets a fresh recognizer
+            try { ((dynamic)recognizer).Dispose(); } catch { }
+            InitializeSpeech();
+            Log("Speech engine ready", "OK");
 
             InitializeTray();
             Log("Tray icon ready", "OK");
@@ -481,6 +505,29 @@ class WinWhisper
                     }
                 }
                 prevHotkey = hotkeyDown;
+
+                // Session died mid-recording — type whatever we captured
+                if (sessionDiedWithText)
+                {
+                    sessionDiedWithText = false;
+                    string text;
+                    lock (accLock) { text = accumulated.ToString(); }
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        UpdateTray(false, "WinWhisper - Ready");
+                        ShowOverlayAutoHide(text, DOT_AMBER);
+                        TypeText(text);
+                        Log("Typed (recovered): '" + text + "'", "OK");
+                    }
+                    HideOverlay();
+                }
+
+                // Auto-reset engine after TimeoutExceeded/UserCanceled
+                if (needsReset && !isListening && !isStopping)
+                {
+                    needsReset = false;
+                    ResetSpeech();
+                }
 
                 // Poll Escape (debug mode only)
                 if (debugMode)
@@ -1001,14 +1048,15 @@ class WinWhisper
         }
         catch (Exception ex) { Log("Stop: " + ex.Message, "ERROR"); }
 
-        // Fallback: if no Result fired but we had hypothesis text, use it
+        // Always append any remaining hypothesis text (the in-progress segment)
         lock (accLock)
         {
-            if (accumulated.Length == 0 && !string.IsNullOrEmpty(currentHypothesis))
+            if (!string.IsNullOrEmpty(currentHypothesis))
             {
+                if (accumulated.Length > 0) accumulated.Append(" ");
                 accumulated.Append(currentHypothesis);
                 Interlocked.Increment(ref resultCount);
-                Log("Using last hypothesis as fallback: " + currentHypothesis);
+                Log("Final segment saved: " + currentHypothesis);
             }
         }
 
@@ -1045,6 +1093,21 @@ class WinWhisper
         {
             dynamic args = eventArgs;
             string text = args.Hypothesis.Text;
+            string prev = currentHypothesis;
+
+            // Detect segment reset: hypothesis suddenly much shorter means
+            // WinRT finalized a segment internally. Save the previous hypothesis.
+            if (prev.Length > 10 && text.Length < prev.Length / 2)
+            {
+                lock (accLock)
+                {
+                    if (accumulated.Length > 0) accumulated.Append(" ");
+                    accumulated.Append(prev);
+                }
+                Interlocked.Increment(ref resultCount);
+                Log("Segment saved: " + prev);
+            }
+
             currentHypothesis = text;
             Interlocked.Increment(ref hypothesisVersion);
             Log("Hypothesis: " + text);
@@ -1052,14 +1115,34 @@ class WinWhisper
         catch { }
     }
 
+    static volatile bool sessionDiedWithText = false;
+
     static void OnSessionCompleted(object sender, object eventArgs)
     {
         try
         {
             dynamic args = eventArgs;
+            string status = args.Status.ToString();
+            bool wasListening = isListening && !isStopping;
             isListening = false;
             sessionCompleted = true;
-            Log("Session completed: " + args.Status.ToString());
+            if (status == "TimeoutExceeded" || status == "UserCanceled")
+            {
+                needsReset = true;
+                // Save current hypothesis before reset loses it
+                if (wasListening && !string.IsNullOrEmpty(currentHypothesis))
+                {
+                    lock (accLock)
+                    {
+                        if (accumulated.Length > 0) accumulated.Append(" ");
+                        accumulated.Append(currentHypothesis);
+                    }
+                    currentHypothesis = "";
+                    sessionDiedWithText = true;
+                    Log("Session died, saved hypothesis");
+                }
+            }
+            Log("Session completed: " + status);
         }
         catch { }
     }
@@ -1086,6 +1169,29 @@ class WinWhisper
     static void TypeText(string text)
     {
         if (string.IsNullOrEmpty(text)) return;
+
+        // Wait for hotkey to be released
+        int wait = 0;
+        while (wait < 500)
+        {
+            bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool plusHeld = (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) != 0;
+            bool numHeld = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0;
+            if (!shiftHeld && !plusHeld && !numHeld) break;
+            Thread.Sleep(10);
+            wait += 10;
+        }
+
+        // Send Backspace to delete the stray "+" typed by the hotkey
+        INPUT[] bksp = new INPUT[2];
+        bksp[0].type = INPUT_KEYBOARD;
+        bksp[0].union.ki.wVk = 0x08; // VK_BACK
+        bksp[1].type = INPUT_KEYBOARD;
+        bksp[1].union.ki.wVk = 0x08;
+        bksp[1].union.ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, bksp, Marshal.SizeOf(typeof(INPUT)));
+        Thread.Sleep(50);
+
         INPUT[] inputs = new INPUT[text.Length * 2];
         for (int i = 0; i < text.Length; i++)
         {
@@ -1097,19 +1203,29 @@ class WinWhisper
             inputs[i * 2 + 1].union.ki.wScan = ch;
             inputs[i * 2 + 1].union.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
         }
-        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        if (sent == 0)
+            Log("SendInput FAILED: error=" + Marshal.GetLastWin32Error(), "ERROR");
+        else
+            Log("SendInput: sent " + sent + "/" + inputs.Length + " events");
     }
 
     // =======================================================================
     //  LOGGING
     // =======================================================================
 
+    static string logFile;
+
     static void Log(string msg, string level)
     {
-        if (!debugMode) return;
         string prefix = level == "OK" ? "[OK] " : level == "ERROR" ? "[ERROR] " : "[INFO] ";
         string time = DateTime.Now.ToString("HH:mm:ss.fff");
-        Console.WriteLine("[" + time + "] " + prefix + msg);
+        string line = "[" + time + "] " + prefix + msg;
+
+        if (debugMode) Console.WriteLine(line);
+
+        try { System.IO.File.AppendAllText(logFile, line + Environment.NewLine); }
+        catch { }
     }
 
     static void Log(string msg) { Log(msg, "INFO"); }
